@@ -27,6 +27,21 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Package native libraries only for the ABIs Flutter is building
+        // (`--target-platform`). Without this, plugin prebuilts leave stray
+        // libs for other ABIs, so e.g. an arm64-only APK installs on a
+        // 32-bit device and crashes at launch. Flutter's plugin sets all its
+        // ABIs before this block runs, so replace its list rather than add.
+        val abiFor = mapOf(
+            "android-arm" to "armeabi-v7a",
+            "android-arm64" to "arm64-v8a",
+            "android-x64" to "x86_64",
+        )
+        (project.findProperty("target-platform") as String?)
+            ?.split(",")
+            ?.mapNotNull { abiFor[it.trim()] }
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { ndk { abiFilters.clear(); abiFilters += it } }
     }
 
     buildTypes {

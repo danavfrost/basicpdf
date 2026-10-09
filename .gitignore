@@ -53,3 +53,4 @@ app.*.map.json
 *.xcresult
 /test/fixtures/character_sheet.pdf
 /tool/qa/out/
+/BasicPDF-32bit.apk
