@@ -10,6 +10,21 @@ No ads, no accounts, no network access, no tracking.
 - Saves as incremental updates, so the original file content, passwords
   and signatures are kept.
 
+## "No access — open it again from Files"?
+
+Basic PDF never asks for access to all your files. Android instead gives it
+permission one file at a time, and how long that lasts depends on how the
+file was opened:
+
+- **Opened with the app's own Open button:** permission lasts, so the file
+  keeps working from Recent.
+- **Tapped in a file manager ("Open with" → Basic PDF):** most file managers
+  hand over one-time access that Android cancels when the app closes. The
+  file is still there, but its Recent entry shows "No access".
+
+To keep a file in Recent, open it once with Basic PDF's **Open** button.
+Long-press a "No access" entry to remove it.
+
 See [SPEC.md](SPEC.md) for the full spec and [PRIVACY.md](PRIVACY.md) for
 the privacy policy.
 
