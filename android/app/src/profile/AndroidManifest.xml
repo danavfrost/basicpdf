@@ -1,0 +1,3 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Intentionally no INTERNET permission (Basic PDF has no network access). -->
+</manifest>
