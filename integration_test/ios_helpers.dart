@@ -13,6 +13,7 @@ import 'package:pdfedit/main.dart';
 import 'package:pdfedit/services/doc_session.dart';
 import 'package:pdfedit/services/file_service.dart';
 import 'package:pdfedit/services/history_store.dart';
+import 'package:pdfedit/services/reading_positions.dart';
 import 'package:pdfedit/services/settings_store.dart';
 
 class QaApp {
@@ -29,7 +30,10 @@ Future<QaApp> startApp(WidgetTester t) async {
   qa.settings = SettingsStore(getApplicationSupportDirectory);
   await qa.settings.load();
   qa.session = DocSession();
-  qa.history = HistoryStore(getApplicationSupportDirectory);
+  qa.history = HistoryStore(
+    getApplicationSupportDirectory,
+    positions: ReadingPositions(getApplicationSupportDirectory),
+  );
   qa.files = PlatformFileService();
   await t.pumpWidget(
     PdfEditApp(

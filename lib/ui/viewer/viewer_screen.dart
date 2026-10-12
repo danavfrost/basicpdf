@@ -9,6 +9,7 @@ import '../../services/doc_location.dart';
 import '../../services/doc_session.dart';
 import '../../services/file_service.dart';
 import '../../services/history_store.dart';
+import '../../services/reading_positions.dart';
 import '../../services/settings_store.dart';
 import '../dialogs/about.dart';
 import '../dialogs/password_dialog.dart';
@@ -321,6 +322,9 @@ class _ViewerScreenState extends State<ViewerScreen> {
           return;
         }
       }
+      // Small JSON, normally loaded at startup already: the reading
+      // position must be known when the pages are first laid out.
+      await widget.history.positions?.load();
       try {
         final ok = await session.open(
           bytes,
@@ -507,6 +511,11 @@ class _ViewerScreenState extends State<ViewerScreen> {
     // The core already knows every page size; pdfrx measures pages
     // progressively, so lay out from the core's sizes.
     final corePages = session.editDoc?.pages;
+    // Reading position (SPEC §1.1): per file, as History identifies it.
+    final loc = session.location;
+    final positions = widget.history.positions;
+    final pageCount = doc.pages.length;
+    final saved = loc == null ? null : positions?.get(loc.key, pageCount);
     return PagesView.forDocument(
       key: ValueKey('doc-${session.serial}'),
       document: doc,
@@ -516,6 +525,18 @@ class _ViewerScreenState extends State<ViewerScreen> {
       topPadding: barHeight,
       onTap: _autoHide.show,
       controller: _pages,
+      initialPosition: saved == null
+          ? null
+          : (page: saved.page, fraction: saved.fraction),
+      onPositionChanged: loc == null || positions == null
+          ? null
+          : (p) => positions.set(
+              loc.key,
+              ReadingPosition(p.page, p.fraction, pageCount),
+            ),
+      // Hidden while editing: fields near the right edge (checkboxes) and
+      // the Fields tool's drags must get every touch there.
+      fastScroll: !_editing,
       overlayBuilder: !_editing || edit == null
           ? (_linger == null
                 ? null

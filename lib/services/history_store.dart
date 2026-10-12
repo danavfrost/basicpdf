@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import 'doc_location.dart';
+import 'reading_positions.dart';
 
 class HistoryEntry {
   final DocLocation location;
@@ -37,8 +38,12 @@ class HistoryStore extends ChangeNotifier {
   Future<void>? _loading;
   Future<void> _saving = Future.value();
 
-  HistoryStore(this._dir, {DateTime Function()? now})
+  HistoryStore(this._dir, {DateTime Function()? now, this.positions})
     : _now = now ?? DateTime.now;
+
+  /// Reading positions of the files in History (null: not remembered).
+  /// Removing a file from History forgets its position too.
+  final ReadingPositions? positions;
 
   bool get isLoaded => _loaded;
 
@@ -87,9 +92,12 @@ class HistoryStore extends ChangeNotifier {
     if (i >= 0) list[i] = HistoryEntry(location, list[i].lastOpened);
   });
 
-  Future<void> remove(DocLocation location) => _mutate(
-    (list) => list.removeWhere((e) => e.location.key == location.key),
-  );
+  Future<void> remove(DocLocation location) {
+    positions?.remove(location.key);
+    return _mutate(
+      (list) => list.removeWhere((e) => e.location.key == location.key),
+    );
+  }
 
   /// Applies [change] to the in-memory list right away (so the UI updates
   /// at once), then — serialized with other writes — re-reads history.json

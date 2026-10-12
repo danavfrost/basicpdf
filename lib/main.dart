@@ -6,6 +6,7 @@ import 'package:path_provider/path_provider.dart';
 import 'services/doc_session.dart';
 import 'services/file_service.dart';
 import 'services/history_store.dart';
+import 'services/reading_positions.dart';
 import 'services/settings_store.dart';
 import 'ui/viewer/viewer_screen.dart';
 
@@ -21,7 +22,10 @@ Future<void> main() async {
   // Tiny local JSON read so the first frame already has the right theme.
   await settings.load();
   // Recent list: loaded in parallel with the first frame, not before it.
-  final history = HistoryStore(getApplicationSupportDirectory)..load();
+  final history = HistoryStore(
+    getApplicationSupportDirectory,
+    positions: ReadingPositions(getApplicationSupportDirectory)..load(),
+  )..load();
   runApp(
     PdfEditApp(
       session: DocSession(),

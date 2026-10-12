@@ -28,6 +28,16 @@ fields, handles encryption, and creates new documents.
   There is no Exit: phones close apps themselves (iOS forbids apps
   quitting; on Android the back gesture leaves the app).
 - Unsaved changes show a dot next to the title.
+- **Reading position**: each file (keyed like History, by its location)
+  reopens where it was left — page + fraction into it, at fit width —
+  saved when scrolling idles, on going to the background and on close;
+  ignored if the page count no longer matches; dropped with its History
+  entry (`positions.json` next to `history.json`).
+- **Fast-scroll thumb** (documents of 4+ pages): a slim thumb appears on
+  the right edge while scrolling and fades ~1.5 s after; dragging it maps
+  to the whole document (also when zoomed) with a "Page 37 / 512" bubble;
+  pages flown past render only once the finger slows. Hidden in edit mode
+  so fields near the edge keep their taps.
 - With no document open, the viewer shows the **Home** state: the Recent
   list with New and Open buttons. The app starts here unless it was
   launched by opening a PDF from another app.

@@ -38,7 +38,22 @@ class PageViewport extends ChangeNotifier {
   }
 
   void _settled() => notifyListeners();
+
+  /// True while the user flies through the document with the fast-scroll
+  /// thumb: pages coming into view wait (blank) instead of rendering, so
+  /// a 2000-page fling doesn't queue 2000 renders.
+  final fast = ValueNotifier<bool>(false);
+
+  @override
+  void dispose() {
+    fast.dispose();
+    super.dispose();
+  }
 }
+
+/// A reading position: page [page] at the top of the view, [fraction]
+/// (0..1) of the way into it. Survives zoom, rotation and screen size.
+typedef PagePosition = ({int page, double fraction});
 
 /// Put under a [MetaData] around a control on a page (a form field): taps
 /// it accepts belong to the control, so a double tap there doesn't zoom.
@@ -90,6 +105,9 @@ class PagesView extends StatefulWidget {
     this.overlayBuilder,
     this.onTap,
     this.controller,
+    this.initialPosition,
+    this.onPositionChanged,
+    this.fastScroll = true,
   });
 
   /// Zoom double tapped from fit-width.
@@ -105,6 +123,20 @@ class PagesView extends StatefulWidget {
   final PageOverlayBuilder? overlayBuilder;
   final VoidCallback? onTap;
 
+  /// Where to start (at fit-width zoom); read on the first layout only.
+  final PagePosition? initialPosition;
+
+  /// The reading position, reported once scrolling or zooming has been
+  /// idle for a moment, when the app goes to the background, and when the
+  /// view goes away.
+  final ValueChanged<PagePosition>? onPositionChanged;
+
+  /// Shows the fast-scroll thumb (documents of more than
+  /// [fastScrollMinPages] pages).
+  final bool fastScroll;
+
+  static const fastScrollMinPages = 4;
+
   /// Convenience for a pdfrx document. [pageSizes] (e.g. from the PDF core,
   /// which knows every page size up front) lets the layout be final before
   /// pdfrx has measured all pages; otherwise pdfrx's sizes are used and the
@@ -117,6 +149,9 @@ class PagesView extends StatefulWidget {
     PageOverlayBuilder? overlayBuilder,
     VoidCallback? onTap,
     PagesController? controller,
+    PagePosition? initialPosition,
+    ValueChanged<PagePosition>? onPositionChanged,
+    bool fastScroll = true,
   }) {
     final known =
         pageSizes != null && pageSizes.length == document.pages.length;
@@ -134,6 +169,9 @@ class PagesView extends StatefulWidget {
         overlayBuilder: overlayBuilder,
         onTap: onTap,
         controller: controller,
+        initialPosition: initialPosition,
+        onPositionChanged: onPositionChanged,
+        fastScroll: fastScroll,
         pageImageBuilder: builder,
       );
     }
@@ -144,6 +182,9 @@ class PagesView extends StatefulWidget {
       overlayBuilder: overlayBuilder,
       onTap: onTap,
       controller: controller,
+      initialPosition: initialPosition,
+      onPositionChanged: onPositionChanged,
+      fastScroll: fastScroll,
       pageImageBuilder: builder,
     );
   }
@@ -163,6 +204,9 @@ class _ProgressivePages extends StatefulWidget {
     required this.onTap,
     required this.controller,
     required this.pageImageBuilder,
+    this.initialPosition,
+    this.onPositionChanged,
+    this.fastScroll = true,
   });
   final rx.PdfDocument document;
   final double topPadding;
@@ -170,6 +214,9 @@ class _ProgressivePages extends StatefulWidget {
   final VoidCallback? onTap;
   final PagesController? controller;
   final PageImageBuilder pageImageBuilder;
+  final PagePosition? initialPosition;
+  final ValueChanged<PagePosition>? onPositionChanged;
+  final bool fastScroll;
 
   @override
   State<_ProgressivePages> createState() => _ProgressivePagesState();
@@ -225,6 +272,9 @@ class _ProgressivePagesState extends State<_ProgressivePages> {
       overlayBuilder: widget.overlayBuilder,
       onTap: widget.onTap,
       controller: widget.controller,
+      initialPosition: widget.initialPosition,
+      onPositionChanged: widget.onPositionChanged,
+      fastScroll: widget.fastScroll,
       pageImageBuilder: (i, px, vp) {
         final p = widget.document.pages[i];
         return PdfPageImage(
@@ -245,7 +295,7 @@ class _PagesViewState extends State<PagesView>
   static const _bottom = 48.0;
   static const _maxScale = 8.0;
 
-  final _v = ScrollController();
+  final _v = _StartScrollController();
 
   /// Horizontal shift of the (zoomed, wider than the view) page column.
   final _hx = ValueNotifier<double>(0);
@@ -287,11 +337,34 @@ class _PagesViewState extends State<PagesView>
   void Function(double t)? _animStep;
   Completer<void>? _animDone;
 
+  // Reading position reporting.
+  bool _restored = false;
+  Timer? _reportTimer;
+  PagePosition? _reported;
+  double _lastOffset = 0;
+
+  // Fast-scroll thumb.
+  final _thumbShown = ValueNotifier<bool>(false);
+  final _thumbDragging = ValueNotifier<bool>(false);
+  Timer? _thumbHideTimer;
+  Timer? _fastTimer;
+  int? _thumbPointer;
+  double _thumbGrab = 0;
+
+  /// Programmatic jumps (rotation, keeping a field in view) that shouldn't
+  /// show the thumb.
+  bool _quietScroll = false;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     widget.controller?._state = this;
+    _v.addListener(_onScroll);
+  }
+
+  void _onScroll() {
+    if (_v.hasClients) _lastOffset = _v.offset;
   }
 
   @override
@@ -302,10 +375,69 @@ class _PagesViewState extends State<PagesView>
       if (old.controller?._state == this) old.controller!._state = null;
       widget.controller?._state = this;
     }
+    if (!widget.fastScroll && old.fastScroll) _hideThumbNow();
+    _keepAnchorOnResize(old.pageSizes);
+  }
+
+  /// Page sizes changed (pdfrx measured more pages): keep the page at the
+  /// top of the view where it is.
+  void _keepAnchorOnResize(List<Size> oldSizes) {
+    if (identical(oldSizes, widget.pageSizes) || _viewW <= 0) return;
+    if (!_v.hasClients || !identical(_geomSizes, oldSizes)) return;
+    final n = widget.pageSizes.length;
+    if (oldSizes.length != n) return;
+    var first = -1;
+    for (var i = 0; i < n; i++) {
+      if (oldSizes[i] != widget.pageSizes[i]) {
+        first = i;
+        break;
+      }
+    }
+    if (first < 0) {
+      // Same sizes in a new list: keep the cached geometry.
+      _geomSizes = widget.pageSizes;
+      return;
+    }
+    final offset = _v.offset;
+    final (page, frac) = _anchorFor(_viewW, _scale, offset, tops: _tops);
+    if (page < first) return; // nothing above the anchor moved
+    _geomW = -1;
+    final v = _offsetFor(_viewW, _scale, page, frac);
+    if ((v - offset).abs() > 0.5) _v.position.correctPixels(v);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Going to the background: the app may be killed without notice.
+    if (state != AppLifecycleState.resumed) _reportNow();
+  }
+
+  /// Reports the reading position once things have been idle a moment.
+  void _scheduleReport() {
+    if (widget.onPositionChanged == null) return;
+    _reportTimer?.cancel();
+    _reportTimer = Timer(const Duration(milliseconds: 500), _reportNow);
+  }
+
+  void _reportNow() {
+    _reportTimer?.cancel();
+    final cb = widget.onPositionChanged;
+    if (cb == null || _viewW <= 0 || widget.pageSizes.isEmpty) return;
+    final offset = _v.hasClients ? _v.offset : _lastOffset;
+    final (page, frac) = _anchorFor(_viewW, _scale, offset);
+    final p = (page: page, fraction: frac);
+    if (p == _reported) return;
+    _reported = p;
+    cb(p);
   }
 
   @override
   void dispose() {
+    _reportNow();
+    _thumbHideTimer?.cancel();
+    _fastTimer?.cancel();
+    _thumbShown.dispose();
+    _thumbDragging.dispose();
     if (widget.controller?._state == this) widget.controller!._state = null;
     WidgetsBinding.instance.removeObserver(this);
     _anim.dispose();
@@ -353,11 +485,22 @@ class _PagesViewState extends State<PagesView>
   double get _listTop => widget.topPadding + _margin;
 
   /// (page index, fraction into it) at the line just under the top bar.
-  (int, double) _anchorFor(double viewW, double scale, double offset) {
-    final tops = _itemTops(viewW);
-    final n = widget.pageSizes.length;
-    if (n == 0) return (0, 0);
-    final y = (offset + widget.topPadding - _listTop) / scale;
+  (int, double) _anchorFor(
+    double viewW,
+    double scale,
+    double offset, {
+    List<double>? tops,
+  }) {
+    return _pageAtContent(
+      (offset + widget.topPadding - _listTop) / scale,
+      tops ?? _itemTops(viewW),
+    );
+  }
+
+  /// (page index, fraction into it) at unscaled content position [y].
+  (int, double) _pageAtContent(double y, List<double> tops) {
+    final n = tops.length - 1;
+    if (n <= 0) return (0, 0);
     var lo = 0, hi = n - 1;
     while (lo < hi) {
       final mid = (lo + hi + 1) >> 1;
@@ -612,7 +755,9 @@ class _PagesViewState extends State<PagesView>
     // Lay out at the new width first, then restore the reading position.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
+      _quietScroll = true;
       _jumpTo(_offsetFor(newW, _scale, page, frac), hFrac * _maxH);
+      _quietScroll = false;
       _revealFocusSoon();
       _viewport._settled();
     });
@@ -679,7 +824,9 @@ class _PagesViewState extends State<PagesView>
       dh = r.right - (me.size.width - side);
     }
     if (dv == 0 && dh == 0) return;
+    _quietScroll = true;
     _jumpTo((_v.hasClients ? _v.offset : 0) + dv, _hx.value + dh);
+    _quietScroll = false;
   }
 
   // ----------------------------------------------------------- 1x pinch
@@ -822,6 +969,7 @@ class _PagesViewState extends State<PagesView>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _viewport._settled();
     });
+    _scheduleReport();
   }
 
   // ------------------------------------------------------------- overlays
@@ -868,10 +1016,16 @@ class _PagesViewState extends State<PagesView>
         _viewH = box.maxHeight;
         final contentW = viewW * _scale;
         _itemTops(viewW);
+        if (!_restored) _restore();
 
-        final list = NotificationListener<ScrollEndNotification>(
-          onNotification: (_) {
-            if (!_gestureActive && !_ticker.isActive) _viewport._settled();
+        final list = NotificationListener<ScrollNotification>(
+          onNotification: (n) {
+            if (n is ScrollUpdateNotification && !_quietScroll) {
+              _showThumb();
+            } else if (n is ScrollEndNotification && _thumbPointer == null) {
+              if (!_gestureActive && !_ticker.isActive) _viewport._settled();
+              _scheduleReport();
+            }
             return false;
           },
           child: ListView.builder(
@@ -915,7 +1069,7 @@ class _PagesViewState extends State<PagesView>
           ),
         );
 
-        return Listener(
+        final pages = Listener(
           onPointerDown: _pointerDown,
           onPointerMove: _pointerMove,
           onPointerUp: _pointerUp,
@@ -961,9 +1115,273 @@ class _PagesViewState extends State<PagesView>
             ),
           ),
         );
+        if (!_thumbAllowed) return pages;
+        return Stack(
+          fit: StackFit.expand,
+          children: [pages, _thumbOverlay(context)],
+        );
       },
     );
   }
+
+  // ------------------------------------------------------- restore
+
+  /// First layout: start at [PagesView.initialPosition] (fit width).
+  void _restore() {
+    _restored = true;
+    final p = widget.initialPosition;
+    if (p == null || _viewW <= 0 || _viewH <= 0) return;
+    if (p.page < 0 || p.page >= widget.pageSizes.length) return;
+    final v = _offsetFor(
+      _viewW,
+      1,
+      p.page,
+      p.fraction.clamp(0.0, 1.0),
+    ).clamp(0.0, _maxVAt(1));
+    _reported = p;
+    _lastOffset = v;
+    if (_v.hasClients) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _jumpTo(v, 0);
+      });
+    } else {
+      // The list is created in this build: start it there (no frame at
+      // the top of the document first, no render of page 1 for nothing).
+      _v.start = v;
+    }
+  }
+
+  // ------------------------------------------------------- fast scroll
+
+  static const _thumbH = 44.0;
+  static const _thumbHitW = 48.0;
+  static const _thumbHitH = 72.0;
+  static const _thumbHideAfter = Duration(milliseconds: 1500);
+
+  bool get _thumbAllowed =>
+      widget.fastScroll &&
+      widget.pageSizes.length >= PagesView.fastScrollMinPages;
+
+  /// Track of the thumb's top edge, in this view's coordinates: below the
+  /// (auto-hiding) top bar's space, above the bottom safe area.
+  (double, double) _thumbTrack(EdgeInsets pad) {
+    final top = widget.topPadding + 8;
+    final bottom = _viewH - math.max(12.0, pad.bottom + 8) - _thumbH;
+    return (top, math.max(top, bottom));
+  }
+
+  double get _scrollFrac {
+    if (!_v.hasClients || !_v.position.hasContentDimensions) return 0;
+    final max = _v.position.maxScrollExtent;
+    return max <= 0 ? 0 : (_v.offset / max).clamp(0.0, 1.0);
+  }
+
+  bool get _longEnough =>
+      _v.hasClients &&
+      _v.position.hasContentDimensions &&
+      _v.position.maxScrollExtent > _viewH;
+
+  void _showThumb() {
+    if (!_thumbAllowed || !_longEnough) return;
+    _thumbShown.value = true;
+    _thumbHideTimer?.cancel();
+    if (_thumbPointer == null) {
+      _thumbHideTimer = Timer(_thumbHideAfter, () {
+        if (mounted && _thumbPointer == null) _thumbShown.value = false;
+      });
+    }
+  }
+
+  void _hideThumbNow() {
+    _thumbHideTimer?.cancel();
+    _thumbShown.value = false;
+    if (_thumbPointer != null) _thumbUp(null);
+  }
+
+  void _thumbDown(PointerDownEvent e) {
+    if (_thumbPointer != null || !_v.hasClients) return;
+    _thumbPointer = e.pointer;
+    _stopFling();
+    if (_anim.isAnimating) _anim.stop();
+    final p = _v.position;
+    if (p.isScrollingNotifier.value) p.jumpTo(p.pixels); // stop a fling
+    final (top, bottom) = _thumbTrack(MediaQuery.paddingOf(context));
+    final thumbTop = top + _scrollFrac * (bottom - top);
+    _thumbGrab = _localY(e.position) - thumbTop;
+    _thumbDragging.value = true;
+    _showThumb();
+  }
+
+  double _localY(Offset global) {
+    final box = context.findRenderObject();
+    return box is RenderBox ? box.globalToLocal(global).dy : global.dy;
+  }
+
+  void _thumbMove(PointerMoveEvent e) {
+    if (e.pointer != _thumbPointer || !_v.hasClients) return;
+    final p = _v.position;
+    if (!p.hasContentDimensions) return;
+    final (top, bottom) = _thumbTrack(MediaQuery.paddingOf(context));
+    final t = bottom <= top
+        ? 0.0
+        : ((_localY(e.position) - _thumbGrab - top) / (bottom - top)).clamp(
+            0.0,
+            1.0,
+          );
+    final target = t * p.maxScrollExtent;
+    // Flying by more than half a screen per move: let the pages coming
+    // into view wait until the finger slows down.
+    if ((target - p.pixels).abs() > _viewH / 2) {
+      _viewport.fast.value = true;
+      _fastTimer?.cancel();
+      _fastTimer = Timer(const Duration(milliseconds: 150), () {
+        if (mounted) _viewport.fast.value = false;
+      });
+    }
+    _jumpTo(target, _hx.value);
+  }
+
+  void _thumbUp(PointerEvent? e) {
+    if (e != null && e.pointer != _thumbPointer) return;
+    _thumbPointer = null;
+    _thumbDragging.value = false;
+    _fastTimer?.cancel();
+    _viewport.fast.value = false;
+    _showThumb(); // restarts the fade-out timer
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _viewport._settled();
+    });
+    _reportNow();
+  }
+
+  /// Page number (1-based) shown in the bubble: the page level with the
+  /// thumb (view y [viewY]), i.e. the page right next to the bubble. At
+  /// the ends of the track that is page 1 and the last page.
+  int _thumbPage(double viewY) {
+    final tops = _itemTops(_viewW);
+    final offset = _v.hasClients ? _v.offset : 0.0;
+    final (page, _) = _pageAtContent(
+      (offset + viewY - _listTop) / _scale,
+      tops,
+    );
+    return page + 1;
+  }
+
+  Widget _thumbOverlay(BuildContext context) {
+    final pad = MediaQuery.paddingOf(context);
+    final scheme = Theme.of(context).colorScheme;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final n = widget.pageSizes.length;
+    return AnimatedBuilder(
+      animation: Listenable.merge([_v, _thumbShown, _thumbDragging]),
+      builder: (context, _) {
+        final shown = _thumbShown.value && _longEnough;
+        final dragging = _thumbDragging.value;
+        final (top, bottom) = _thumbTrack(pad);
+        final t = _scrollFrac;
+        final thumbTop = top + t * (bottom - top);
+        final right = pad.right;
+        final hitTop = thumbTop - (_thumbHitH - _thumbH) / 2;
+        const bubbleH = 40.0;
+        final double bubbleTop = (thumbTop + _thumbH / 2 - bubbleH / 2).clamp(
+          top,
+          math.max(top, bottom + _thumbH - bubbleH),
+        );
+        return IgnorePointer(
+          ignoring: !shown,
+          child: AnimatedOpacity(
+            key: const ValueKey('fast-scroll'),
+            opacity: shown ? 1 : 0,
+            duration: Duration(milliseconds: shown ? 120 : 300),
+            child: Stack(
+              children: [
+                Positioned(
+                  key: const ValueKey('fast-scroll-thumb'),
+                  right: right,
+                  top: hitTop,
+                  width: _thumbHitW,
+                  height: _thumbHitH,
+                  child: Listener(
+                    behavior: HitTestBehavior.opaque,
+                    onPointerDown: _thumbDown,
+                    onPointerMove: _thumbMove,
+                    onPointerUp: _thumbUp,
+                    onPointerCancel: _thumbUp,
+                    child: Align(
+                      alignment: Alignment.centerRight,
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 120),
+                        margin: const EdgeInsets.only(right: 3),
+                        width: dragging ? 8 : 6,
+                        height: _thumbH,
+                        decoration: BoxDecoration(
+                          color: dragging
+                              ? scheme.primary
+                              : (dark
+                                    ? const Color(0xFFB8B8B8)
+                                    : const Color(0xFF6E6E6E)),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: dark
+                                ? const Color(0x66000000)
+                                : const Color(0x99FFFFFF),
+                            width: 0.75,
+                          ),
+                          boxShadow: const [
+                            BoxShadow(blurRadius: 3, color: Color(0x40000000)),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (dragging)
+                  Positioned(
+                    // Clear of the finger holding the thumb.
+                    right: right + 56,
+                    top: bubbleTop,
+                    height: bubbleH,
+                    child: IgnorePointer(
+                      child: Material(
+                        key: const ValueKey('fast-scroll-bubble'),
+                        color: scheme.inverseSurface,
+                        elevation: 3,
+                        shape: const StadiumBorder(),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Center(
+                            widthFactor: 1,
+                            child: Text(
+                              'Page ${_thumbPage(thumbTop + _thumbH / 2)} / $n',
+                              style: TextStyle(
+                                color: scheme.onInverseSurface,
+                                fontSize: 15,
+                                fontWeight: FontWeight.w500,
+                                fontFeatures: const [
+                                  ui.FontFeature.tabularFigures(),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// A ScrollController whose scroll position starts at [start] (set just
+/// before the list is first built).
+class _StartScrollController extends ScrollController {
+  double start = 0;
+  @override
+  double get initialScrollOffset => start;
 }
 
 /// Renders one pdfrx page at [pixelWidth] and keeps showing the previous
@@ -1013,7 +1431,14 @@ class _PdfPageImageState extends State<PdfPageImage> {
   void initState() {
     super.initState();
     widget.viewport?.addListener(_scheduleTile);
+    widget.viewport?.fast.addListener(_onFastChanged);
     _render();
+  }
+
+  bool get _fast => widget.viewport?.fast.value ?? false;
+
+  void _onFastChanged() {
+    if (!_fast) _render();
   }
 
   @override
@@ -1021,7 +1446,9 @@ class _PdfPageImageState extends State<PdfPageImage> {
     super.didUpdateWidget(old);
     if (old.viewport != widget.viewport) {
       old.viewport?.removeListener(_scheduleTile);
+      old.viewport?.fast.removeListener(_onFastChanged);
       widget.viewport?.addListener(_scheduleTile);
+      widget.viewport?.fast.addListener(_onFastChanged);
     }
     if (widget.page != _renderedPage || _targetWidth != _renderedWidth) {
       _debounce?.cancel();
@@ -1051,7 +1478,7 @@ class _PdfPageImageState extends State<PdfPageImage> {
   }
 
   Future<void> _render() async {
-    if (_busy || !mounted) return;
+    if (_busy || !mounted || _fast) return;
     final page = widget.page;
     final w = _targetWidth;
     if (page == _renderedPage && w == _renderedWidth) return;
@@ -1217,6 +1644,7 @@ class _PdfPageImageState extends State<PdfPageImage> {
   @override
   void dispose() {
     widget.viewport?.removeListener(_scheduleTile);
+    widget.viewport?.fast.removeListener(_onFastChanged);
     _debounce?.cancel();
     _tileDebounce?.cancel();
     _image?.dispose();
